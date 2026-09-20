@@ -1,0 +1,9 @@
+VTF repaired harness build-only repository.
+
+Canonical repaired source commit:
+c4ad206c9e75e3c0e71b806e2b3d4fb30ea21d48
+
+Expected receiver blob:
+a308627476b264b5df196b1f5a43e823ef4b1883
+
+This repository contains only the isolated device-test harness and build workflow.
