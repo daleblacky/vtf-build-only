@@ -1,0 +1,69 @@
+name: Build repaired VTF harness
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout build-only repo
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter 3.47.5
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.5'
+          channel: stable
+          cache: true
+
+      - name: Verify exact repaired receiver
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXPECTED="a308627476b264b5df196b1f5a43e823ef4b1883"
+          ACTUAL="$(git hash-object lib/vtf_native_receiver.dart)"
+          echo "EXPECTED_RECEIVER_BLOB=$EXPECTED"
+          echo "ACTUAL_RECEIVER_BLOB=$ACTUAL"
+          test "$ACTUAL" = "$EXPECTED"
+
+      - name: Resolve dependencies
+        run: flutter pub get
+
+      - name: Stage isolated Android package shell
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf android
+          STAGE="$(mktemp -d)"
+          flutter create             --platforms=android             --org com.vexlorgrid.vtftest.nativehttp             --project-name vtf_native_http_harness             "$STAGE/scaffold"
+          mv "$STAGE/scaffold/android" android
+          rm -rf "$STAGE"
+
+      - name: Analyze repaired harness
+        run: flutter analyze lib/vtf_native_receiver.dart lib/vtf_device_test_main.dart
+
+      - name: Build repaired side-by-side APK
+        run: flutter build apk --debug -t lib/vtf_device_test_main.dart
+
+      - name: Record exact APK proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=build/app/outputs/flutter-apk/app-debug.apk
+          test -s "$APK"
+          echo "VTF_REPAIRED_SOURCE_COMMIT=c4ad206c9e75e3c0e71b806e2b3d4fb30ea21d48"
+          echo "VTF_RECEIVER_BLOB=$(git hash-object lib/vtf_native_receiver.dart)"
+          echo "VTF_REPAIRED_APK_SHA256=$(sha256sum "$APK" | cut -d ' ' -f 1)"
+          echo "VTF_REPAIRED_APK_BYTES=$(wc -c < "$APK" | tr -d ' ')"
+
+      - name: Upload repaired harness APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: vtf-repaired-c4ad206-apk
+          path: build/app/outputs/flutter-apk/app-debug.apk
