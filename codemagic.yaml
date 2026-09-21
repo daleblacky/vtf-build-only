@@ -16,7 +16,7 @@ workflows:
       - name: Verify exact repaired receiver
         script: |
           set -euo pipefail
-          EXPECTED="a308627476b264b5df196b1f5a43e823ef4b1883"
+          EXPECTED="85e4fc0d80dca9843007488029e06e67f619b422"
           ACTUAL="$(git hash-object lib/vtf_native_receiver.dart)"
           echo "EXPECTED_RECEIVER_BLOB=$EXPECTED"
           echo "ACTUAL_RECEIVER_BLOB=$ACTUAL"
@@ -32,8 +32,8 @@ workflows:
           STAGE="$(mktemp -d)"
           flutter create \
             --platforms=android \
-            --org com.vexlorgrid.vtftest.repaired \
-            --project-name vtf_repaired_harness \
+            --org com.vexlorgrid.vtftest.adaptive \
+            --project-name vtf_adaptive_harness \
             "$STAGE/scaffold"
           mv "$STAGE/scaffold/android" android
           rm -rf "$STAGE"
@@ -49,7 +49,7 @@ workflows:
           set -euo pipefail
           APK=build/app/outputs/flutter-apk/app-debug.apk
           test -s "$APK"
-          echo "VTF_REPAIRED_SOURCE_COMMIT=c4ad206c9e75e3c0e71b806e2b3d4fb30ea21d48"
+          echo "VTF_REPAIRED_SOURCE_COMMIT=b93c5e39b44b32cb9e7878bb6cb36a98774f353d"
           echo "VTF_REPAIRED_RECEIVER_BLOB=$(git hash-object lib/vtf_native_receiver.dart)"
           echo "VTF_REPAIRED_APK_SHA256=$(shasum -a 256 "$APK" | awk '{print $1}')"
           echo "VTF_REPAIRED_APK_BYTES=$(wc -c < "$APK" | tr -d ' ')"
