@@ -231,6 +231,18 @@ class _VtfHarnessScreenState extends State<VtfHarnessScreen> {
     }
   }
 
+  Future<void> _clearVerifiedChunkCache() async {
+    if (_busy) return;
+    await _receiver.clearVerifiedChunkCache();
+    await _record(
+      'VERIFIED_CHUNK_CACHE_CLEARED',
+      'sha=${_state?.artifactSha}',
+    );
+    if (mounted) {
+      setState(() => _status = 'Verified chunk cache cleared');
+    }
+  }
+
   Future<void> _removeFinalOnly() async {
     if (_busy) return;
     final out = await _receiver.finalFile();
@@ -274,6 +286,11 @@ class _VtfHarnessScreenState extends State<VtfHarnessScreen> {
           OutlinedButton(
             onPressed: _busy ? null : _resetTransferPreserveLearning,
             child: const Text('Reset transfer data; preserve learning'),
+          ),
+          const SizedBox(height: 10),
+          OutlinedButton(
+            onPressed: _busy ? null : _clearVerifiedChunkCache,
+            child: const Text('Clear verified chunk cache'),
           ),
           const SizedBox(height: 10),
           OutlinedButton(
