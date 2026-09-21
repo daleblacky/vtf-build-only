@@ -1,0 +1,50 @@
+workflows:
+  vtf-repaired-device-build:
+    name: VTF repaired device harness
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      flutter: 3.47.5
+    scripts:
+      - name: Verify exact repaired receiver
+        script: |
+          set -euo pipefail
+          EXPECTED="a308627476b264b5df196b1f5a43e823ef4b1883"
+          ACTUAL="$(git hash-object lib/vtf_native_receiver.dart)"
+          echo "EXPECTED_RECEIVER_BLOB=$EXPECTED"
+          echo "ACTUAL_RECEIVER_BLOB=$ACTUAL"
+          test "$ACTUAL" = "$EXPECTED"
+
+      - name: Resolve dependencies
+        script: flutter pub get
+
+      - name: Stage isolated repaired Android shell
+        script: |
+          set -euo pipefail
+          rm -rf android
+          STAGE="$(mktemp -d)"
+          flutter create \
+            --platforms=android \
+            --org com.vexlorgrid.vtftest.repaired \
+            --project-name vtf_repaired_harness \
+            "$STAGE/scaffold"
+          mv "$STAGE/scaffold/android" android
+          rm -rf "$STAGE"
+
+      - name: Analyze repaired harness
+        script: flutter analyze lib/vtf_native_receiver.dart lib/vtf_device_test_main.dart
+
+      - name: Build repaired debug APK
+        script: flutter build apk --debug -t lib/vtf_device_test_main.dart
+
+      - name: Record exact artifact proof
+        script: |
+          set -euo pipefail
+          APK=build/app/outputs/flutter-apk/app-debug.apk
+          test -s "$APK"
+          echo "VTF_REPAIRED_SOURCE_COMMIT=c4ad206c9e75e3c0e71b806e2b3d4fb30ea21d48"
+          echo "VTF_REPAIRED_RECEIVER_BLOB=$(git hash-object lib/vtf_native_receiver.dart)"
+          echo "VTF_REPAIRED_APK_SHA256=$(shasum -a 256 "$APK" | awk '{print $1}')"
+          echo "VTF_REPAIRED_APK_BYTES=$(wc -c < "$APK" | tr -d ' ')"
+    artifacts:
+      - build/app/outputs/flutter-apk/app-debug.apk
