@@ -31,7 +31,17 @@ class VtfNativeReceiver {
       'https://ihrocbdgtfblfsifaiwk.supabase.co/functions/v1/vtf-bootstrap';
   static const bootstrapVersion = 'VTF_SEGMENT_BOOTSTRAP_V8';
 
+  static const _workerOptions = <int>[3, 4, 5, 6];
+  static const _progressInterval = Duration(milliseconds: 150);
+  static const _minimumLearningBytes = 8 * 1024 * 1024;
+
   final Dio _dio = Dio();
+  final HttpClient _httpClient = HttpClient()
+    ..maxConnectionsPerHost = 8
+    ..idleTimeout = const Duration(seconds: 30);
+
+  DateTime _lastProgressEmit = DateTime.fromMillisecondsSinceEpoch(0);
+  int _runReconnects = 0;
 
   Future<Directory> _dir(String artifactSha) async => Directory(
         '${(await getApplicationSupportDirectory()).path}/vtf/$artifactSha',
@@ -92,6 +102,12 @@ class VtfNativeReceiver {
 
     _validateManifest(segments, totalBytes);
 
+    final initialReceivedBytes = await _receivedBytes(segments, dir);
+    final workerCount = _selectWorkerCount(prefs);
+    final transferStartedAt = DateTime.now();
+    _lastProgressEmit = DateTime.fromMillisecondsSinceEpoch(0);
+    _runReconnects = 0;
+
     final out = await finalFile();
     if (await _wholeFileValid(out, artifactSha, totalBytes)) {
       final state = VtfTransferState(
@@ -145,7 +161,9 @@ class VtfNativeReceiver {
       }
     }
 
-    await Future.wait([worker(), worker(), worker()]);
+    await Future.wait(
+      List<Future<void>>.generate(workerCount, (_) => worker()),
+    );
 
     final staging = File('${out.path}.part');
     if (await staging.exists()) {
@@ -181,6 +199,15 @@ class VtfNativeReceiver {
 
     await staging.rename(out.path);
     await prefs.setBool('vtf:$artifactSha:verified', true);
+
+    final transferredBytes =
+        (totalBytes - initialReceivedBytes).clamp(0, totalBytes);
+    await _learnFromVerifiedTransfer(
+      prefs: prefs,
+      workerCount: workerCount,
+      transferredBytes: transferredBytes,
+      elapsed: DateTime.now().difference(transferStartedAt),
+    );
 
     final state = VtfTransferState(
       artifactSha,
@@ -253,10 +280,9 @@ class VtfNativeReceiver {
     }
 
     Future<void> downloadFrom(int offset) async {
-      final client = HttpClient();
       RandomAccessFile? raf;
       try {
-        final request = await client.getUrl(Uri.parse(signedUrl));
+        final request = await _httpClient.getUrl(Uri.parse(signedUrl));
         request.headers.set(HttpHeaders.acceptEncodingHeader, 'identity');
         if (offset > 0) {
           request.headers.set(HttpHeaders.rangeHeader, 'bytes=$offset-');
@@ -292,7 +318,7 @@ class VtfNativeReceiver {
 
         await for (final chunk in response) {
           await raf.writeFrom(chunk);
-          _emit(
+          await _emitThrottled(
             artifactSha,
             totalBytes,
             segments,
@@ -303,7 +329,6 @@ class VtfNativeReceiver {
         await raf.flush();
       } finally {
         await raf?.close();
-        client.close(force: true);
       }
     }
 
@@ -335,12 +360,14 @@ class VtfNativeReceiver {
         if (after == expectedBytes) break;
         if (after <= before || reconnects >= maxReconnects) rethrow;
         reconnects++;
+        _runReconnects++;
         continue;
       } on SocketException {
         final after = await partial.exists() ? await partial.length() : 0;
         if (after == expectedBytes) break;
         if (after <= before || reconnects >= maxReconnects) rethrow;
         reconnects++;
+        _runReconnects++;
         continue;
       }
 
@@ -358,7 +385,17 @@ class VtfNativeReceiver {
         );
       }
       reconnects++;
+      _runReconnects++;
     }
+
+    await _emitThrottled(
+      artifactSha,
+      totalBytes,
+      segments,
+      dir,
+      onProgress,
+      force: true,
+    );
 
     if (!await _segmentValid(partial, segment)) {
       if (await partial.exists()) {
@@ -395,6 +432,123 @@ class VtfNativeReceiver {
 
     final digest = await sha256.bind(file.openRead()).first;
     return digest.toString() == expectedSha;
+  }
+
+  Future<int> _receivedBytes(
+    List<Map<String, dynamic>> segments,
+    Directory dir,
+  ) async {
+    var bytes = 0;
+    for (final segment in segments) {
+      final index = segment['index'] as int;
+      final expectedBytes = segment['bytes'] as int;
+      final file = File(
+        '${dir.path}/segment-${index.toString().padLeft(4, '0')}.bin',
+      );
+      final partial = File('${file.path}.part');
+
+      if (await file.exists()) {
+        final length = await file.length();
+        bytes += length > expectedBytes ? expectedBytes : length;
+      } else if (await partial.exists()) {
+        final length = await partial.length();
+        bytes += length > expectedBytes ? expectedBytes : length;
+      }
+    }
+    return bytes;
+  }
+
+  int _selectWorkerCount(SharedPreferences prefs) {
+    for (final workers in _workerOptions) {
+      final samples = prefs.getInt('vtf:optimizer:samples:$workers') ?? 0;
+      if (samples == 0) return workers;
+    }
+
+    final totalSamples = _workerOptions.fold<int>(
+      0,
+      (sum, workers) =>
+          sum + (prefs.getInt('vtf:optimizer:samples:$workers') ?? 0),
+    );
+
+    if (totalSamples > 0 && totalSamples % 8 == 0) {
+      return _workerOptions[(totalSamples ~/ 8) % _workerOptions.length];
+    }
+
+    var bestWorkers = _workerOptions.first;
+    var bestScore = -1.0;
+    for (final workers in _workerOptions) {
+      final score = prefs.getDouble('vtf:optimizer:score:$workers') ?? 0.0;
+      if (score > bestScore) {
+        bestScore = score;
+        bestWorkers = workers;
+      }
+    }
+    return bestWorkers;
+  }
+
+  Future<void> _learnFromVerifiedTransfer({
+    required SharedPreferences prefs,
+    required int workerCount,
+    required int transferredBytes,
+    required Duration elapsed,
+  }) async {
+    if (transferredBytes < _minimumLearningBytes ||
+        elapsed.inMilliseconds <= 0) {
+      return;
+    }
+
+    final seconds = elapsed.inMilliseconds / 1000.0;
+    final bytesPerSecond = transferredBytes / seconds;
+    final reliabilityPenalty = 1.0 + (_runReconnects * 0.05);
+    final score = bytesPerSecond / reliabilityPenalty;
+
+    final samplesKey = 'vtf:optimizer:samples:$workerCount';
+    final scoreKey = 'vtf:optimizer:score:$workerCount';
+    final samples = prefs.getInt(samplesKey) ?? 0;
+    final oldScore = prefs.getDouble(scoreKey);
+    final learnedScore =
+        oldScore == null ? score : (oldScore * 0.70) + (score * 0.30);
+
+    await prefs.setInt(samplesKey, samples + 1);
+    await prefs.setDouble(scoreKey, learnedScore);
+    await prefs.setInt('vtf:optimizer:last_workers', workerCount);
+    await prefs.setDouble('vtf:optimizer:last_bps', bytesPerSecond);
+    await prefs.setInt('vtf:optimizer:last_reconnects', _runReconnects);
+  }
+
+  Future<String> optimizerSummary() async {
+    final prefs = await SharedPreferences.getInstance();
+    final nextWorkers = _selectWorkerCount(prefs);
+    final lastWorkers = prefs.getInt('vtf:optimizer:last_workers');
+    final lastBps = prefs.getDouble('vtf:optimizer:last_bps');
+    final reconnects = prefs.getInt('vtf:optimizer:last_reconnects') ?? 0;
+    return 'next_workers=$nextWorkers '
+        'last_workers=${lastWorkers ?? 'none'} '
+        'last_bps=${lastBps?.toStringAsFixed(0) ?? 'none'} '
+        'last_reconnects=$reconnects';
+  }
+
+  Future<void> _emitThrottled(
+    String artifactSha,
+    int totalBytes,
+    List<Map<String, dynamic>> segments,
+    Directory dir,
+    void Function(VtfTransferState) callback, {
+    bool force = false,
+  }) async {
+    final now = DateTime.now();
+    if (!force &&
+        now.difference(_lastProgressEmit) < _progressInterval) {
+      return;
+    }
+    _lastProgressEmit = now;
+    await _emit(
+      artifactSha,
+      totalBytes,
+      segments,
+      dir,
+      callback,
+    );
   }
 
   Future<void> _emit(
