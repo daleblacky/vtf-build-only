@@ -516,6 +516,34 @@ class VtfNativeReceiver {
     await prefs.setInt('vtf:optimizer:last_reconnects', _runReconnects);
   }
 
+  Future<void> resetTransferDataPreserveLearning(String artifactSha) async {
+    if (!_isSha256(artifactSha)) {
+      throw StateError('Invalid artifact SHA for reset');
+    }
+
+    final dir = await _dir(artifactSha);
+    if (await dir.exists()) {
+      await dir.delete(recursive: true);
+    }
+
+    final out = await finalFile();
+    if (await out.exists()) {
+      await out.delete();
+    }
+    final staging = File('${out.path}.part');
+    if (await staging.exists()) {
+      await staging.delete();
+    }
+
+    final prefs = await SharedPreferences.getInstance();
+    final keys = prefs.getKeys().where((key) =>
+        key.startsWith('vtf:$artifactSha:') &&
+        !key.startsWith('vtf:optimizer:'));
+    for (final key in keys.toList()) {
+      await prefs.remove(key);
+    }
+  }
+
   Future<String> optimizerSummary() async {
     final prefs = await SharedPreferences.getInstance();
     final nextWorkers = _selectWorkerCount(prefs);
