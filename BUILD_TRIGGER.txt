@@ -1,3 +1,3 @@
-Adaptive VTF verification build trigger
-source_packet=13717cfafef554ec8d2b2252052632b2a74ef71e
-receiver_blob=85e4fc0d80dca9843007488029e06e67f619b422
+Adaptive VTF learner-control build trigger
+source_packet=3954be5e9de0599650b20a518a0b46f70a4bad5c
+receiver_blob=3b9f7046e44c717c6156aa0d22f371cf1ead2163
