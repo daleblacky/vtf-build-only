@@ -26,6 +26,18 @@ class VtfTransferState {
   double get progress => totalBytes == 0 ? 0 : receivedBytes / totalBytes;
 }
 
+class _SingleDigestSink implements Sink<Digest> {
+  Digest? digest;
+
+  @override
+  void add(Digest data) {
+    digest = data;
+  }
+
+  @override
+  void close() {}
+}
+
 class VtfNativeReceiver {
   static const api =
       'https://ihrocbdgtfblfsifaiwk.supabase.co/functions/v1/vtf-bootstrap';
@@ -42,10 +54,19 @@ class VtfNativeReceiver {
 
   DateTime _lastProgressEmit = DateTime.fromMillisecondsSinceEpoch(0);
   int _runReconnects = 0;
+  int _runNetworkBytes = 0;
+  int _runCacheHits = 0;
 
   Future<Directory> _dir(String artifactSha) async => Directory(
         '${(await getApplicationSupportDirectory()).path}/vtf/$artifactSha',
       )..createSync(recursive: true);
+
+  Future<Directory> _cacheDir() async => Directory(
+        '${(await getApplicationSupportDirectory()).path}/vtf/chunk-cache',
+      )..createSync(recursive: true);
+
+  Future<File> _cacheFile(String segmentSha) async =>
+      File('${(await _cacheDir()).path}/$segmentSha.bin');
 
   Future<File> finalFile() async => File(
         '${(await getDownloadsDirectory())?.path ?? (await getApplicationSupportDirectory()).path}/'
@@ -102,11 +123,12 @@ class VtfNativeReceiver {
 
     _validateManifest(segments, totalBytes);
 
-    final initialReceivedBytes = await _receivedBytes(segments, dir);
     final workerCount = _selectWorkerCount(prefs);
     final transferStartedAt = DateTime.now();
     _lastProgressEmit = DateTime.fromMillisecondsSinceEpoch(0);
     _runReconnects = 0;
+    _runNetworkBytes = 0;
+    _runCacheHits = 0;
 
     final out = await finalFile();
     if (await _wholeFileValid(out, artifactSha, totalBytes)) {
@@ -139,17 +161,24 @@ class VtfNativeReceiver {
           if (await file.exists()) {
             await file.delete();
           }
-          await _downloadSegment(
-            artifactSha: artifactSha,
-            totalBytes: totalBytes,
-            segment: segment,
-            file: file,
-            segments: segments,
-            dir: dir,
-            onProgress: onProgress,
-          );
+
+          final restored = await _restoreSegmentFromCache(file, segment);
+          if (restored) {
+            _runCacheHits++;
+          } else {
+            await _downloadSegment(
+              artifactSha: artifactSha,
+              totalBytes: totalBytes,
+              segment: segment,
+              file: file,
+              segments: segments,
+              dir: dir,
+              onProgress: onProgress,
+            );
+          }
         }
 
+        await _storeVerifiedSegmentInCache(file, segment);
         await prefs.setBool('vtf:$artifactSha:$index:done', true);
         await _emit(
           artifactSha,
@@ -200,12 +229,11 @@ class VtfNativeReceiver {
     await staging.rename(out.path);
     await prefs.setBool('vtf:$artifactSha:verified', true);
 
-    final transferredBytes =
-        (totalBytes - initialReceivedBytes).clamp(0, totalBytes);
     await _learnFromVerifiedTransfer(
       prefs: prefs,
       workerCount: workerCount,
-      transferredBytes: transferredBytes,
+      networkBytes: _runNetworkBytes,
+      cacheHits: _runCacheHits,
       elapsed: DateTime.now().difference(transferStartedAt),
     );
 
@@ -265,19 +293,39 @@ class VtfNativeReceiver {
   }) async {
     final index = segment['index'] as int;
     final expectedBytes = segment['bytes'] as int;
+    final expectedSha = segment['sha256'] as String;
     final signedUrl = segment['signed_url'] as String;
     final partial = File('${file.path}.part');
-
-    if (await _segmentValid(partial, segment)) {
-      await partial.rename(file.path);
-      return;
-    }
 
     var start = await partial.exists() ? await partial.length() : 0;
     if (start > expectedBytes) {
       await partial.delete();
       start = 0;
     }
+
+    if (start == expectedBytes) {
+      if (await _segmentValid(partial, segment)) {
+        await partial.rename(file.path);
+        return;
+      }
+      await partial.delete();
+      start = 0;
+    }
+
+    late _SingleDigestSink digestSink;
+    late ByteConversionSink hashSink;
+
+    Future<void> resetHasher({bool seedPartial = true}) async {
+      digestSink = _SingleDigestSink();
+      hashSink = sha256.startChunkedConversion(digestSink);
+      if (seedPartial && await partial.exists()) {
+        await for (final chunk in partial.openRead()) {
+          hashSink.add(chunk);
+        }
+      }
+    }
+
+    await resetHasher();
 
     Future<void> downloadFrom(int offset) async {
       RandomAccessFile? raf;
@@ -290,7 +338,8 @@ class VtfNativeReceiver {
 
         final response = await request.close();
         final status = response.statusCode;
-        final contentRange = response.headers.value(HttpHeaders.contentRangeHeader);
+        final contentRange =
+            response.headers.value(HttpHeaders.contentRangeHeader);
 
         if (offset > 0) {
           final rangeAccepted = status == HttpStatus.partialContent &&
@@ -318,6 +367,8 @@ class VtfNativeReceiver {
 
         await for (final chunk in response) {
           await raf.writeFrom(chunk);
+          hashSink.add(chunk);
+          _runNetworkBytes += chunk.length;
           await _emitThrottled(
             artifactSha,
             totalBytes,
@@ -350,10 +401,12 @@ class VtfNativeReceiver {
         await downloadFrom(offset);
       } on StateError {
         if (offset == 0 || usedRangeFallback) rethrow;
+        hashSink.close();
         if (await partial.exists()) {
           await partial.delete();
         }
         usedRangeFallback = true;
+        await resetHasher(seedPartial: false);
         continue;
       } on HttpException {
         final after = await partial.exists() ? await partial.length() : 0;
@@ -397,14 +450,84 @@ class VtfNativeReceiver {
       force: true,
     );
 
-    if (!await _segmentValid(partial, segment)) {
+    hashSink.close();
+    final digest = digestSink.digest;
+    final finalBytes = await partial.exists() ? await partial.length() : 0;
+    if (finalBytes != expectedBytes ||
+        digest == null ||
+        digest.toString() != expectedSha) {
       if (await partial.exists()) {
         await partial.delete();
       }
-      throw StateError('Segment $index verification failed');
+      throw StateError('Segment $index streaming verification failed');
     }
 
     await partial.rename(file.path);
+  }
+
+  Future<bool> _restoreSegmentFromCache(
+    File destination,
+    Map<String, dynamic> segment,
+  ) async {
+    final expectedSha = segment['sha256'] as String;
+    final cache = await _cacheFile(expectedSha);
+    if (!await cache.exists()) return false;
+
+    if (!await _segmentValid(cache, segment)) {
+      await cache.delete();
+      return false;
+    }
+
+    final temp = File('${destination.path}.cache-copy');
+    if (await temp.exists()) {
+      await temp.delete();
+    }
+    await cache.copy(temp.path);
+
+    if (!await _segmentValid(temp, segment)) {
+      if (await temp.exists()) {
+        await temp.delete();
+      }
+      return false;
+    }
+
+    await temp.rename(destination.path);
+    return true;
+  }
+
+  Future<void> _storeVerifiedSegmentInCache(
+    File source,
+    Map<String, dynamic> segment,
+  ) async {
+    final expectedBytes = segment['bytes'] as int;
+    final expectedSha = segment['sha256'] as String;
+    final cache = await _cacheFile(expectedSha);
+
+    if (await cache.exists()) {
+      if (await cache.length() == expectedBytes) return;
+      await cache.delete();
+    }
+
+    final index = segment['index'] as int;
+    final temp = File('${cache.path}.$index.part');
+    if (await temp.exists()) {
+      await temp.delete();
+    }
+
+    await source.copy(temp.path);
+    if (await temp.length() != expectedBytes) {
+      await temp.delete();
+      throw StateError('Chunk cache copy length mismatch for segment $index');
+    }
+
+    try {
+      await temp.rename(cache.path);
+    } on FileSystemException {
+      if (await temp.exists()) {
+        await temp.delete();
+      }
+      if (!await cache.exists()) rethrow;
+    }
   }
 
   Future<bool> _segmentValid(
@@ -432,30 +555,6 @@ class VtfNativeReceiver {
 
     final digest = await sha256.bind(file.openRead()).first;
     return digest.toString() == expectedSha;
-  }
-
-  Future<int> _receivedBytes(
-    List<Map<String, dynamic>> segments,
-    Directory dir,
-  ) async {
-    var bytes = 0;
-    for (final segment in segments) {
-      final index = segment['index'] as int;
-      final expectedBytes = segment['bytes'] as int;
-      final file = File(
-        '${dir.path}/segment-${index.toString().padLeft(4, '0')}.bin',
-      );
-      final partial = File('${file.path}.part');
-
-      if (await file.exists()) {
-        final length = await file.length();
-        bytes += length > expectedBytes ? expectedBytes : length;
-      } else if (await partial.exists()) {
-        final length = await partial.length();
-        bytes += length > expectedBytes ? expectedBytes : length;
-      }
-    }
-    return bytes;
   }
 
   int _selectWorkerCount(SharedPreferences prefs) {
@@ -489,16 +588,26 @@ class VtfNativeReceiver {
   Future<void> _learnFromVerifiedTransfer({
     required SharedPreferences prefs,
     required int workerCount,
-    required int transferredBytes,
+    required int networkBytes,
+    required int cacheHits,
     required Duration elapsed,
   }) async {
-    if (transferredBytes < _minimumLearningBytes ||
-        elapsed.inMilliseconds <= 0) {
+    final elapsedMs = elapsed.inMilliseconds;
+    final seconds = elapsedMs <= 0 ? 0.0 : elapsedMs / 1000.0;
+    final bytesPerSecond =
+        seconds <= 0 ? 0.0 : networkBytes / seconds;
+
+    await prefs.setInt('vtf:optimizer:last_workers', workerCount);
+    await prefs.setDouble('vtf:optimizer:last_bps', bytesPerSecond);
+    await prefs.setInt('vtf:optimizer:last_reconnects', _runReconnects);
+    await prefs.setInt('vtf:optimizer:last_network_bytes', networkBytes);
+    await prefs.setInt('vtf:optimizer:last_cache_hits', cacheHits);
+    await prefs.setInt('vtf:optimizer:last_elapsed_ms', elapsedMs);
+
+    if (networkBytes < _minimumLearningBytes || elapsedMs <= 0) {
       return;
     }
 
-    final seconds = elapsed.inMilliseconds / 1000.0;
-    final bytesPerSecond = transferredBytes / seconds;
     final reliabilityPenalty = 1.0 + (_runReconnects * 0.05);
     final score = bytesPerSecond / reliabilityPenalty;
 
@@ -511,9 +620,6 @@ class VtfNativeReceiver {
 
     await prefs.setInt(samplesKey, samples + 1);
     await prefs.setDouble(scoreKey, learnedScore);
-    await prefs.setInt('vtf:optimizer:last_workers', workerCount);
-    await prefs.setDouble('vtf:optimizer:last_bps', bytesPerSecond);
-    await prefs.setInt('vtf:optimizer:last_reconnects', _runReconnects);
   }
 
   Future<void> resetTransferDataPreserveLearning(String artifactSha) async {
@@ -544,16 +650,28 @@ class VtfNativeReceiver {
     }
   }
 
+  Future<void> clearVerifiedChunkCache() async {
+    final cache = await _cacheDir();
+    if (await cache.exists()) {
+      await cache.delete(recursive: true);
+    }
+  }
+
   Future<String> optimizerSummary() async {
     final prefs = await SharedPreferences.getInstance();
     final nextWorkers = _selectWorkerCount(prefs);
     final lastWorkers = prefs.getInt('vtf:optimizer:last_workers');
     final lastBps = prefs.getDouble('vtf:optimizer:last_bps');
     final reconnects = prefs.getInt('vtf:optimizer:last_reconnects') ?? 0;
+    final networkBytes =
+        prefs.getInt('vtf:optimizer:last_network_bytes') ?? 0;
+    final cacheHits = prefs.getInt('vtf:optimizer:last_cache_hits') ?? 0;
     return 'next_workers=$nextWorkers '
         'last_workers=${lastWorkers ?? 'none'} '
         'last_bps=${lastBps?.toStringAsFixed(0) ?? 'none'} '
-        'last_reconnects=$reconnects';
+        'last_reconnects=$reconnects '
+        'last_network_bytes=$networkBytes '
+        'last_cache_hits=$cacheHits';
   }
 
   Future<void> _emitThrottled(
