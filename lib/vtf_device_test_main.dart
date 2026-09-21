@@ -39,6 +39,7 @@ class _VtfHarnessScreenState extends State<VtfHarnessScreen> {
   bool _receiptLoaded = false;
   int _lastRecordedCompletedSegments = -1;
   String _status = 'Ready';
+  String _optimizer = 'optimizer: awaiting verified sample';
 
   Future<File?> _receiptFile() async {
     final downloads = await getDownloadsDirectory();
@@ -112,6 +113,9 @@ class _VtfHarnessScreenState extends State<VtfHarnessScreen> {
     try {
       final state = await _receiver.run(onProgress: _observe);
       final optimizer = await _receiver.optimizerSummary();
+      if (mounted) {
+        setState(() => _optimizer = 'optimizer: $optimizer');
+      }
       await _record(
         'RUN_VERIFIED',
         'sha=${state.artifactSha} bytes=${state.totalBytes} '
@@ -204,6 +208,29 @@ class _VtfHarnessScreenState extends State<VtfHarnessScreen> {
     }
   }
 
+  Future<void> _resetTransferPreserveLearning() async {
+    if (_busy) return;
+    final sha = _state?.artifactSha;
+    if (sha == null) {
+      setState(() => _status = 'No artifact SHA yet');
+      return;
+    }
+
+    await _receiver.resetTransferDataPreserveLearning(sha);
+    final optimizer = await _receiver.optimizerSummary();
+    await _record(
+      'TRANSFER_RESET_LEARNING_PRESERVED',
+      'sha=$sha optimizer={$optimizer}',
+    );
+    if (mounted) {
+      setState(() {
+        _state = null;
+        _optimizer = 'optimizer: $optimizer';
+        _status = 'Transfer reset; learning preserved';
+      });
+    }
+  }
+
   Future<void> _removeFinalOnly() async {
     if (_busy) return;
     final out = await _receiver.finalFile();
@@ -236,10 +263,17 @@ class _VtfHarnessScreenState extends State<VtfHarnessScreen> {
                   'verified=${s.verified}\n'
                   'sha=${s.artifactSha}',
           ),
+          const SizedBox(height: 8),
+          Text(_optimizer),
           const SizedBox(height: 20),
           FilledButton(
             onPressed: _busy ? null : _runReceiver,
             child: const Text('Start / Resume'),
+          ),
+          const SizedBox(height: 10),
+          OutlinedButton(
+            onPressed: _busy ? null : _resetTransferPreserveLearning,
+            child: const Text('Reset transfer data; preserve learning'),
           ),
           const SizedBox(height: 10),
           OutlinedButton(
