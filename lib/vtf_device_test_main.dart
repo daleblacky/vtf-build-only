@@ -111,9 +111,11 @@ class _VtfHarnessScreenState extends State<VtfHarnessScreen> {
     await _record('RUN_START');
     try {
       final state = await _receiver.run(onProgress: _observe);
+      final optimizer = await _receiver.optimizerSummary();
       await _record(
         'RUN_VERIFIED',
-        'sha=${state.artifactSha} bytes=${state.totalBytes}',
+        'sha=${state.artifactSha} bytes=${state.totalBytes} '
+        'optimizer={$optimizer}',
       );
       if (mounted) {
         setState(() {
